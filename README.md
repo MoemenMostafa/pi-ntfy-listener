@@ -19,7 +19,7 @@ phone  ◀────────────  ntfy server  ◀─────�
   3. Derived: `pi-<dirname>-<sha1(cwd)[0..10]>` — unique and unguessable per project
 - **Loop protection** — self posts ("Pi (…)" / "Claude (…)") are ignored
 - **Crash/disconnect self-healing** — the stream restarts with exponential backoff and is re-bound on session start, reload, or project switch
-- **Timestamp cursors** — resume where you left off per project, stored under `~/.pi/agent/ntfy/<hash>.since` (unix seconds, never message ids — load-balanced ntfy servers reject ids from other instances)
+- **Timestamp cursors** — resume where you left off per project, stored under `~/.pi/agent/ntfy/<hash>.since` (unix seconds, never message ids — load-balanced ntfy servers reject ids from other instances). Cursors are stored one second past the last delivered message because ntfy's `since=` is inclusive, so a restart or new session never replays it.
 - **Commands**: `/ntfy-start`, `/ntfy-stop`, `/ntfy-status`, `/ntfy-topic`
 
 ## Install

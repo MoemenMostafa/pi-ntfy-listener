@@ -49,6 +49,9 @@
  *     a ntfy message id — ntfy load balancers route requests to different
  *     server instances and since=<id> only resolves on the instance holding
  *     that message, intermittently answering 400 "invalid since parameter").
+ *     ntfy's since=<ts> is INCLUSIVE, so the cursor is stored as
+ *     <message ts> + 1 — otherwise the last delivered message replays into
+ *     every restart / new session.
  *   - Log:    ~/.pi/agent/ntfy/<hash10>.log
  *
  * Commands: /ntfy-start, /ntfy-stop, /ntfy-status, /ntfy-topic.
@@ -494,7 +497,9 @@ export default function (pi: ExtensionAPI) {
 					(title, body, ts) => {
 						delivered = true;
 						backoff = 3000;
-						writeCursor(binding, String(ts));
+						// ntfy since is inclusive — advance 1s past this message so a
+						// restart/new session never replays it.
+						writeCursor(binding, String(ts + 1));
 						log(binding, `[${title}] ${body}`);
 						const text = `[ntfy ${title}] ${body}`;
 						try {

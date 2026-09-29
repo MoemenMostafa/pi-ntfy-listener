@@ -1,6 +1,6 @@
 {
   "name": "pi-ntfy-listener",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi extension that streams a per-project ntfy topic into your session: messages from your phone become real user turns, agent replies go back to the channel",
   "keywords": [
     "pi-package",
