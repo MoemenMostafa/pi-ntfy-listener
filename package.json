@@ -1,0 +1,38 @@
+{
+  "name": "pi-ntfy-listener",
+  "version": "1.0.0",
+  "description": "Pi extension that streams a per-project ntfy topic into your session: messages from your phone become real user turns, agent replies go back to the channel",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ntfy",
+    "push",
+    "notifications",
+    "messaging",
+    "remote-control"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MoemenMostafa/pi-ntfy-listener.git"
+  },
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
