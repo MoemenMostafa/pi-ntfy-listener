@@ -54,7 +54,38 @@
  *     every restart / new session.
  *   - Log:    ~/.pi/agent/ntfy/<hash10>.log
  *
- * Commands: /ntfy-start, /ntfy-stop, /ntfy-status, /ntfy-topic.
+ * Delivery arbitration (single owner):
+ *   Multiple pi sessions in the SAME project all bind to the same topic —
+ *   without arbitration each of them independently wakes on every message,
+ *   multiplying provider requests (and burning through rate limits on long
+ *   sessions whose context is re-sent every turn). A per-topic owner lock
+ *   (~/.pi/agent/ntfy/<hash10>.owner, JSON { pid, cwd, ts }) elects exactly
+ *   one streaming session per topic:
+ *     - Claimed with O_EXCL; an existing lock owned by a dead pid or with a
+ *       heartbeat older than ~2 intervals is taken over.
+ *     - The owner heartbeats every 15s (interval + agent_end) and releases
+ *       the lock on stop/shutdown.
+ *     - Non-owner sessions stand by (no stream, no deliveries) and poll for
+ *       ownership — they pick up seamlessly when the owner dies.
+ *
+ * Burst coalescing:
+ *   Messages arriving within a quiet window (~5s, capped at ~45s per batch)
+ *   are joined into ONE user message instead of one turn each.
+ *
+ * Context guard + hold:
+ *   Before delivering, the session's context usage is checked. When above a
+ *   threshold (default 60% of the context window), messages are HELD in
+ *   ~/.pi/agent/ntfy/<hash10>.hold.json (cursor already advanced, so they
+ *   survive crashes) and the user is notified; the hold flushes on the next
+ *   agent_end once usage is back under the threshold, or via /ntfy-flush.
+ *   No surprises: a bloated session is never pushed a new turn silently.
+ *
+ * Commands: /ntfy-start, /ntfy-stop, /ntfy-status, /ntfy-topic, /ntfy-flush.
+ *
+ * Tunables (env override > config.json > default):
+ *   NTFY_COALESCE_MS            / coalesceMs            (5000)
+ *   NTFY_COALESCE_MAX_MS        / coalesceMaxMs         (45000)
+ *   NTFY_CONTEXT_GUARD_PERCENT  / contextGuardPercent   (60)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -94,6 +125,18 @@ interface NtfyConfig {
 	baseUrl?: string;
 	authToken?: string;
 	tunnel?: TunnelConfig;
+	/** Quiet window for joining burst messages into one delivery. */
+	coalesceMs?: number;
+	/** Hard cap on how long the first queued message may wait. */
+	coalesceMaxMs?: number;
+	/** Hold deliveries when context usage percent exceeds this (0 disables). */
+	contextGuardPercent?: number;
+}
+
+interface OwnerLock {
+	pid: number;
+	cwd: string;
+	ts: number;
 }
 
 interface ResolvedConnection {
@@ -283,6 +326,150 @@ function writeCursor(binding: ProjectBinding, value: string): void {
 	}
 }
 
+/** Per-topic owner lock: ~/.pi/agent/ntfy/<key>.owner */
+function ownerFile(binding: ProjectBinding): string {
+	return path.join(STATE_DIR, `${binding.key}.owner`);
+}
+
+/** Per-topic hold queue: ~/.pi/agent/ntfy/<key>.hold.json (array of messages). */
+function holdFile(binding: ProjectBinding): string {
+	return path.join(STATE_DIR, `${binding.key}.hold.json`);
+}
+
+// --- Runtime tunables (env > config.json > default) ------------------------
+
+function runtimeTunables() {
+	const cfg = readConfigFile();
+	const coalesceMs = Number(
+		process.env.NTFY_COALESCE_MS ?? cfg.coalesceMs,
+	);
+	const coalesceMaxMs = Number(
+		process.env.NTFY_COALESCE_MAX_MS ?? cfg.coalesceMaxMs,
+	);
+	const guardRaw = Number(
+		process.env.NTFY_CONTEXT_GUARD_PERCENT ?? cfg.contextGuardPercent,
+	);
+	const quiet = Number.isFinite(coalesceMs) && coalesceMs >= 0 ? coalesceMs : 5_000;
+	const cap = Number.isFinite(coalesceMaxMs) && coalesceMaxMs >= quiet
+		? coalesceMaxMs
+		: Math.max(45_000, quiet);
+	const guardPercent =
+		Number.isFinite(guardRaw) && guardRaw >= 0 && guardRaw <= 100 ? guardRaw : 60;
+	return { coalesceMs: quiet, coalesceMaxMs: cap, contextGuardPercent: guardPercent };
+}
+
+// --- Owner lock -------------------------------------------------------------
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+const OWNER_STALE_MS = 45_000; // ~2 missed 15s heartbeats
+const HEARTBEAT_MS = 15_000;
+const STANDBY_POLL_MS = 5_000;
+
+function readOwnerLock(binding: ProjectBinding): OwnerLock | undefined {
+	try {
+		const raw = JSON.parse(fs.readFileSync(ownerFile(binding), "utf8"));
+		if (raw && typeof raw.pid === "number" && typeof raw.ts === "number") {
+			return { pid: raw.pid, cwd: String(raw.cwd ?? ""), ts: raw.ts };
+		}
+	} catch {
+		/* missing/unreadable */
+	}
+	return undefined;
+}
+
+function writeOwnerLock(binding: ProjectBinding): void {
+	const lock: OwnerLock = { pid: process.pid, cwd: binding.cwd, ts: Date.now() };
+	fs.writeFileSync(ownerFile(binding), JSON.stringify(lock));
+}
+
+/**
+ * Try to become the streaming owner for this topic. Returns true when this
+ * process owns (or already owns) the lock. Dead or stale owners are taken
+ * over; a live owner means we go on standby.
+ */
+function tryAcquireOwner(binding: ProjectBinding): boolean {
+	const lock: OwnerLock = { pid: process.pid, cwd: binding.cwd, ts: Date.now() };
+	try {
+		fs.writeFileSync(ownerFile(binding), JSON.stringify(lock), { flag: "wx" });
+		return true;
+	} catch {
+		/* exists — evaluate below */
+	}
+	const current = readOwnerLock(binding);
+	if (current?.pid === process.pid) return true; // same process (e.g. /reload)
+	if (!current) { // unreadable garbage — replace it
+		try { fs.unlinkSync(ownerFile(binding)); } catch { return false; }
+		try { fs.writeFileSync(ownerFile(binding), JSON.stringify(lock), { flag: "wx" }); return true; } catch { return false; }
+	}
+	if (current) {
+		const dead = !isProcessAlive(current.pid);
+		const stale = Date.now() - current.ts > OWNER_STALE_MS;
+		if (dead || stale) {
+			// Atomic-ish takeover: brief race window is acceptable — worst case a
+			// message is delivered by two sessions once during a takeover.
+			try { fs.unlinkSync(ownerFile(binding)); } catch { return false; }
+			try { fs.writeFileSync(ownerFile(binding), JSON.stringify(lock), { flag: "wx" }); return true; } catch { return false; }
+		}
+	}
+	return false;
+}
+
+function heartbeatOwner(binding: ProjectBinding): void {
+	const current = readOwnerLock(binding);
+	if (current?.pid === process.pid) writeOwnerLock(binding);
+}
+
+function releaseOwnerIfMine(binding: ProjectBinding): void {
+	const current = readOwnerLock(binding);
+	if (current?.pid === process.pid) {
+		try { fs.unlinkSync(ownerFile(binding)); } catch { /* gone already */ }
+	}
+}
+
+function isStillOwner(binding: ProjectBinding): boolean {
+	return readOwnerLock(binding)?.pid === process.pid;
+}
+
+// --- Hold queue -------------------------------------------------------------
+
+function readHoldQueue(binding: ProjectBinding): string[] {
+	try {
+		const raw = JSON.parse(fs.readFileSync(holdFile(binding), "utf8"));
+		return Array.isArray(raw) ? (raw as unknown[]).filter((m): m is string => typeof m === "string") : [];
+	} catch {
+		return [];
+	}
+}
+
+function appendHoldQueue(binding: ProjectBinding, message: string): void {
+	const held = readHoldQueue(binding);
+	held.push(message);
+	try {
+		fs.mkdirSync(STATE_DIR, { recursive: true });
+		fs.writeFileSync(holdFile(binding), JSON.stringify(held, null, 2));
+	} catch {
+		/* non-fatal */
+	}
+}
+
+function writeHoldQueue(binding: ProjectBinding, messages: string[]): void {
+	try {
+		fs.mkdirSync(STATE_DIR, { recursive: true });
+		if (messages.length === 0) fs.unlinkSync(holdFile(binding));
+		else fs.writeFileSync(holdFile(binding), JSON.stringify(messages, null, 2));
+	} catch {
+		/* non-fatal */
+	}
+}
+
 /**
  * Valid cursor = unix timestamp. Anything else is dropped: ntfy load
  * balancers route requests to different instances, so `since=<message id>`
@@ -293,7 +480,10 @@ function normalizedSince(binding: ProjectBinding): string {
 	if (/^\d{10,13}$/.test(raw)) {
 		return raw.length === 13 ? raw.slice(0, 10) : raw; // ms -> s
 	}
-	return "now";
+	// No cursor yet for this project. A literal "now" is rejected by ntfy
+	// (HTTP 400 "invalid since parameter" — silently ends the stream loop), so
+	// fall back to the current time minus a small grace window for clock skew.
+	return String(Math.floor(Date.now() / 1000) - 5);
 }
 
 /**
@@ -409,6 +599,19 @@ function connectOnce(
 				timeout: STREAM_TIMEOUT_MS,
 			},
 			(res) => {
+				if (res.statusCode !== 200) {
+					// Surface server rejections (e.g. a bad `since`) — ntfy answers 400
+					// with a JSON error and just ends the stream otherwise.
+					let body = "";
+					res.setEncoding("utf8");
+					res.on("data", (c: string) => { body = (body + c).slice(0, 200); });
+					res.on("end", () => {
+						log(currentBinding, `[extension] stream rejected: HTTP ${res.statusCode} ${body.trim()}`);
+						done();
+					});
+					res.on("error", () => done());
+					return;
+				}
 				res.setEncoding("utf8");
 				let buf = "";
 				res.on("data", (chunk: string) => {
@@ -456,6 +659,12 @@ function connectOnce(
 
 /** Bindings live for the lifetime of the session — one listener per project. */
 let currentBinding: ProjectBinding | undefined;
+/**
+ * Most recent ExtensionContext, captured from lifecycle handlers so network
+ * callbacks can consult context usage without owning a live ctx reference.
+ * Invalidated on session replacement (a replacement supplies a fresh ctx).
+ */
+let currentCtx: any;
 
 // ---------------------------------------------------------------------------
 // Extension
@@ -463,11 +672,131 @@ let currentBinding: ProjectBinding | undefined;
 
 export default function (pi: ExtensionAPI) {
 	let abort: AbortController | undefined;
+	/** Coalescing queue: prefixed messages waiting to be delivered. */
+	let pending: string[] = [];
+	let firstPendingAt: number | undefined;
+	let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
+	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	let isOwner = false;
+	let wasOwner = false;
+	/** One log line per distinct owner state, instead of a line per 5s poll. */
+	const lastStandbyLog: Record<string, string> = {};
 
 	const running = (): boolean => abort !== undefined && !abort.signal.aborted;
 
+	const stopTimers = (): void => {
+		if (coalesceTimer) { clearTimeout(coalesceTimer); coalesceTimer = undefined; }
+		if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = undefined; }
+	};
+
 	const stop = (): void => {
 		abort?.abort();
+	};
+
+	/** Context guard: true when the captured ctx says the session is too full. */
+	const beyondContextGuard = (): boolean => {
+		const threshold = runtimeTunables().contextGuardPercent;
+		if (threshold <= 0) return false; // disabled
+		try {
+			const usage = currentCtx?.getContextUsage?.();
+			if (!usage || typeof usage.percent !== "number") return false; // unknown — deliver
+			return usage.percent >= threshold;
+		} catch {
+			return false;
+		}
+	};
+
+	const sendUserMessageSafe = (text: string, binding: ProjectBinding): void => {
+		try {
+			pi.sendUserMessage(text, { deliverAs: "followUp" });
+		} catch {
+			try {
+				pi.sendUserMessage(text);
+			} catch (err) {
+				log(binding, `[extension] sendUserMessage failed: ${String(err)}`);
+			}
+		}
+	};
+
+	/** Deliver one batch (or a single held message), respecting the guard. */
+	const deliverJoined = (text: string, binding: ProjectBinding): void => {
+		if (beyondContextGuard()) {
+			appendHoldQueue(binding, text);
+			const threshold = runtimeTunables().contextGuardPercent;
+			log(binding, `[extension] context guard — held message (n=${readHoldQueue(binding).length}, threshold=${threshold}%)`);
+			try {
+				currentCtx?.ui?.notify?.(
+					`ntfy: held message — session context >${threshold}% of window. It will be delivered after compaction or via /ntfy-flush.`,
+					"warning",
+				);
+			} catch {
+				/* no UI — the log already captured it */
+			}
+			return;
+		}
+		sendUserMessageSafe(text, binding);
+	};
+
+	/** Push every pending message into a single joined delivery. */
+	const flushPending = (binding: ProjectBinding): void => {
+		if (coalesceTimer) { clearTimeout(coalesceTimer); coalesceTimer = undefined; }
+		const batch = pending;
+		pending = [];
+		firstPendingAt = undefined;
+		if (!batch.length) return;
+		deliverJoined(batch.join("\n\n"), binding);
+	};
+
+	/** Debounce window so a burst of pushes costs one turn, not N. */
+	const enqueueMessage = (text: string, binding: ProjectBinding): void => {
+		pending.push(text);
+		const { coalesceMs, coalesceMaxMs } = runtimeTunables();
+		if (coalesceMs <= 0) {
+			flushPending(binding);
+			return;
+		}
+		const now = Date.now();
+		firstPendingAt ??= now;
+		if (coalesceTimer) clearTimeout(coalesceTimer);
+		const elapsed = now - (firstPendingAt ?? now);
+		const delay = Math.min(coalesceMs, Math.max(0, coalesceMaxMs - elapsed));
+		coalesceTimer = setTimeout(() => {
+			coalesceTimer = undefined;
+			flushPending(binding);
+		}, delay);
+	};
+
+	/** Deliver everything held back by the context guard (joined, no surprise turns). */
+	const flushHeld = (binding: ProjectBinding, force = false): void => {
+		const held = readHoldQueue(binding);
+		if (!held.length) return;
+		if (!force && beyondContextGuard()) return;
+		writeHoldQueue(binding, []);
+		deliverJoined(held.join("\n\n"), binding);
+	};
+
+	/**
+	 * Poll for ownership: acquire, log only on transitions, and flush any
+	 * hold queue left behind by a previous life of this topic.
+	 */
+	const acquireAndMaybeFlushHold = (binding: ProjectBinding): void => {
+		wasOwner = isOwner;
+		isOwner = tryAcquireOwner(binding);
+		if (!isOwner) {
+			if (!wasOwner) {
+				const current = readOwnerLock(binding);
+				const stamp = current
+					? `pid ${current.pid} · cwd ${current.cwd || "?"} · heartbeat ${new Date(current.ts).toISOString()}`
+					: "unclaimed";
+				if (lastStandbyLog[binding.key] !== stamp) {
+					lastStandbyLog[binding.key] = stamp;
+					log(binding, `[extension] standing by — topic owned by ${stamp}`);
+				}
+			}
+			return;
+		}
+		if (!wasOwner) log(binding, `[extension] became topic owner (pid ${process.pid}), ${readHoldQueue(binding).length} held`);
+		if (readHoldQueue(binding).length) flushHeld(binding);
 	};
 
 	const start = (cwd: string): void => {
@@ -477,13 +806,30 @@ export default function (pi: ExtensionAPI) {
 		abort = new AbortController();
 		const signal = abort.signal;
 		const connection = resolveConnection();
+		try {
+			releaseOwnerIfMine(binding); // stale lock from a previous life of this pid
+		} catch { /* non-fatal */ }
 		log(
 			binding,
 			`[extension] listener started (project=${binding.cwd}, topic=${binding.topic} via ${binding.source}, since=${normalizedSince(binding)}, server=${connection.serverName}${connection.viaTunnel ? ` via tunnel ${connection.host}:${connection.port}` : ""})`,
 		);
+		acquireAndMaybeFlushHold(binding);
+		if (isOwner) heartbeatOwner(binding); // fresh ts on (re)claim
+		heartbeatTimer = setInterval(() => {
+			try {
+				if (isOwner) heartbeatOwner(binding);
+			} catch { /* non-fatal */ }
+		}, HEARTBEAT_MS);
 		void (async () => {
 			let backoff = 3000;
 			while (!signal.aborted) {
+				if (!isOwner) {
+					// Standby: no stream, no deliveries — just polling for ownership.
+					await sleep(STANDBY_POLL_MS, signal);
+					if (signal.aborted) break;
+					acquireAndMaybeFlushHold(binding);
+					continue;
+				}
 				try {
 					await ensureTunnel(connection);
 				} catch {
@@ -497,27 +843,36 @@ export default function (pi: ExtensionAPI) {
 					(title, body, ts) => {
 						delivered = true;
 						backoff = 3000;
-						// ntfy since is inclusive — advance 1s past this message so a
-						// restart/new session never replays it.
+						// Advance the cursor immediately — a crash must never replay
+						// a message (ntfy since is inclusive).
 						writeCursor(binding, String(ts + 1));
 						log(binding, `[${title}] ${body}`);
-						const text = `[ntfy ${title}] ${body}`;
-						try {
-							pi.sendUserMessage(text, { deliverAs: "followUp" });
-						} catch {
-							try {
-								pi.sendUserMessage(text);
-							} catch (err) {
-								log(binding, `[extension] sendUserMessage failed: ${String(err)}`);
-							}
-						}
+						enqueueMessage(`[ntfy ${title}] ${body}`, binding);
 					},
 				);
+				// Only the owner streams; a lost lock drops back to standby.
+				if (!isStillOwner(binding)) {
+					isOwner = false;
+					log(binding, "[extension] lost topic ownership — standing by");
+					continue;
+				}
 				if (signal.aborted) break;
 				if (delivered) backoff = 3000;
 				await sleep(backoff, signal);
 				backoff = Math.min(backoff * 2, 30_000);
 			}
+			// Keep held messages + release ownership so a standby can take over.
+			// Any unsent pending messages are parked in the hold queue (cursor is
+			// already advanced) — never delivered mid-teardown.
+			if (pending.length) {
+				const unsent = pending;
+				pending = [];
+				for (const text of unsent) appendHoldQueue(binding, text);
+				log(binding, `[extension] parked ${unsent.length} undelivered message(s) in the hold queue`);
+			}
+			releaseOwnerIfMine(binding);
+			stopTimers();
+			isOwner = false;
 			log(binding, "[extension] listener stopped");
 		})();
 	};
@@ -554,13 +909,41 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("ntfy-flush", {
+		description:
+			"Deliver ntfy messages held back by the context guard (arg: force = ignore guard)",
+		handler: async (args, ctx) => {
+			const binding = currentBinding ?? bindProject(ctx.cwd);
+			const held = readHoldQueue(binding);
+			if (!held.length) {
+				ctx.ui.notify("ntfy: nothing held", "info");
+				return;
+			}
+			const force = /^(force|-f)/.test(args?.trim() ?? "");
+			if (!force && beyondContextGuard()) {
+				ctx.ui.notify(
+					`ntfy: context still >${runtimeTunables().contextGuardPercent}% of window — compact first or use "force"`,
+					"warning",
+				);
+				return;
+			}
+			writeHoldQueue(binding, []);
+			deliverJoined(held.join("\n\n"), binding);
+			ctx.ui.notify(`ntfy: delivered ${held.length} held message(s)`, "info");
+		},
+	});
+
 	pi.registerCommand("ntfy-status", {
 		description: "Show ntfy listener state (project binding)",
 		handler: async (_args, ctx) => {
 			const binding = bindProject(ctx.cwd);
 			const connection = resolveConnection();
+			const owner = readOwnerLock(binding);
+			const mine = isStillOwner(binding);
+			const held = readHoldQueue(binding);
+			const tunables = runtimeTunables();
 			ctx.ui.notify(
-				`ntfy listener: ${running() ? "running" : "stopped"} — project ${binding.slug} (${binding.cwd}), topic ${binding.topic} (via ${binding.source}), cursor ${currentBinding?.key === binding.key ? normalizedSince(binding) : "n/a (not started)"}, server ${connection.serverName}${connection.viaTunnel ? ` via tunnel ${connection.host}:${connection.port}` : " (direct)"}`,
+				`ntfy listener: ${running() ? "running" : "stopped"} — project ${binding.slug} (${binding.cwd}), topic ${binding.topic} (via ${binding.source}), cursor ${currentBinding?.key === binding.key ? normalizedSince(binding) : "n/a (not started)"}, server ${connection.serverName}${connection.viaTunnel ? ` via tunnel ${connection.host}:${connection.port}` : " (direct)"}; owner: ${mine ? `this session (pid ${process.pid})` : owner ? `pid ${owner.pid} (${owner.cwd})` : "unclaimed"}; role: ${mine ? "owner (streaming)" : running() ? "standby" : "off"}; coalesce: ${tunables.coalesceMs}ms (cap ${tunables.coalesceMaxMs}ms); context guard: ${tunables.contextGuardPercent}%; held: ${held.length}`,
 				"info",
 			);
 		},
@@ -592,24 +975,44 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		// Session start / /reload / new / resume / fork always rebinds to the
 		// session's project; a switch between projects restarts the listener.
+		currentCtx = ctx;
 		const previousBinding = currentBinding;
 		const binding = bindProject(ctx.cwd);
+		if (previousBinding && previousBinding.key !== binding.key) {
+			// Project switch: hand over cleanly, then rebind under the new topic.
+			releaseOwnerIfMine(previousBinding);
+		}
 		if (!running() || (previousBinding && previousBinding.key !== binding.key)) {
 			stop();
 		}
 		start(ctx.cwd);
 	});
 
-	// Self-heal: after /reload the runtime is replaced and session_start does
-	// not always re-fire mid-session — re-check on every turn boundary.
-	pi.on("agent_end", () => {
-		if (!running() && currentBinding) {
-			log(currentBinding, "[extension] agent_end — listener was down, restarting");
-			start(currentBinding.cwd);
+	pi.on("agent_start", () => {
+		try { if (currentBinding && isOwner) heartbeatOwner(currentBinding); } catch { /* non-fatal */ }
+	});
+
+	// Self-heal + ownership hygiene at every turn boundary: restart a dead
+	// listener, refresh the owner heartbeat, and release any held messages
+	// once the session context is back under the guard threshold.
+	pi.on("agent_end", (_event, ctx) => {
+		currentCtx = ctx;
+		try {
+			if (!currentBinding) return;
+			if (running()) {
+				if (isOwner) heartbeatOwner(currentBinding);
+				flushHeld(currentBinding);
+			} else {
+				log(currentBinding, "[extension] agent_end — listener was down, restarting");
+				start(currentBinding.cwd);
+			}
+		} catch (err) {
+			log(currentBinding, `[extension] agent_end handler error: ${String(err)}`);
 		}
 	});
 
 	pi.on("session_shutdown", () => {
 		stop();
+		if (currentBinding) releaseOwnerIfMine(currentBinding);
 	});
 }
